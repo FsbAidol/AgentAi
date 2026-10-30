@@ -8,6 +8,8 @@ import shutil
 import subprocess
 import sys
 from urllib.parse import urlsplit
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 DEFAULT_URL = "https://gwarden.su/v1"
 DEFAULT_MODEL = "deepseek-v4.1-flash-1017"
@@ -98,6 +100,70 @@ def add_profile(args):
     print(f"Профиль {name} сохранён: {storage_path()}")
 
 
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def fetch_models(profile):
+    # Do not forward a bearer token to a redirect destination.
+    base_url = validate_url(profile["base_url"])
+    request = Request(base_url + "/models", headers={
+        "Authorization": "Bearer " + profile["api_key"], "Accept": "application/json"
+    })
+    try:
+        with build_opener(NoRedirect()).open(request, timeout=10) as response:
+            data = json.loads(response.read(2_000_001))
+        if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+            raise ValueError("неверный формат ответа /models")
+        models = []
+        for entry in data["data"]:
+            if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+                try:
+                    model = validate_model(entry["id"])
+                except ValueError:
+                    continue
+                if model not in models:
+                    models.append(model)
+        if not models:
+            raise ValueError("список моделей пуст")
+        return models
+    except HTTPError as exc:
+        raise ValueError(f"API вернул HTTP {exc.code} при запросе /models") from None
+    except (URLError, OSError, ValueError, UnicodeError) as exc:
+        # Do not echo a server response or URL: either could contain sensitive data.
+        raise ValueError("не удалось загрузить каталог /models; проверьте соединение и API") from exc
+
+
+def profile_models(profile):
+    cached = profile.get("models", [])
+    if not isinstance(cached, list):
+        cached = []
+    models = [profile["model"]]
+    for value in cached:
+        if isinstance(value, str):
+            try:
+                validate_model(value)
+            except ValueError:
+                continue
+            if value not in models:
+                models.append(value)
+    return models
+
+
+def get_profile(profiles, name):
+    if name not in profiles:
+        raise ValueError(f"Профиль {name} не найден. Сначала выполните: agentai add {name}")
+    return profiles[name]
+
+
+def sync_models(profiles, name):
+    profile = get_profile(profiles, name)
+    profile["models"] = fetch_models(profile)
+    save_profiles(profiles)
+    return profile_models(profile)
+
+
 def make_config(profile, full_access):
     permission = "allow" if full_access else "ask"
     return {
@@ -107,7 +173,7 @@ def make_config(profile, full_access):
             "npm": "@ai-sdk/openai-compatible",
             "name": "AgentAI API",
             "options": {"baseURL": profile["base_url"], "apiKey": "{env:AGENTAI_API_KEY}"},
-            "models": {profile["model"]: {"name": profile["model"]}},
+            "models": {model: {"name": model} for model in profile_models(profile)},
         }},
         "permission": permission,
         "agent": {"agentai": {"description": "Локальный помощник AgentAI", "mode": "primary",
@@ -117,8 +183,7 @@ def make_config(profile, full_access):
 
 def launch(args):
     profiles = load_profiles()
-    if args.profile not in profiles:
-        raise ValueError(f"Профиль {args.profile} не найден. Сначала выполните: agentai add {args.profile}")
+    profile = get_profile(profiles, args.profile)
     executable = shutil.which("opencode")
     if not executable:
         raise ValueError("OpenCode не найден в PATH. Установите его: npm install -g opencode-ai")
@@ -127,7 +192,11 @@ def launch(args):
         if not args.yes:
             if not sys.stdin.isatty() or input("Введите FULL для продолжения: ").strip() != "FULL":
                 raise ValueError("Запуск отменён.")
-    profile = profiles[args.profile]
+    try:
+        sync_models(profiles, args.profile)
+    except (ValueError, OSError) as exc:
+        print(f"Не удалось обновить список моделей: {exc}. Используются сохранённые модели. "
+              "Можно указать модель вручную: agentai model ID", file=sys.stderr)
     env = os.environ.copy()
     env["AGENTAI_API_KEY"] = profile["api_key"]
     env["OPENCODE_CONFIG_CONTENT"] = json.dumps(make_config(profile, args.full_access), ensure_ascii=False)
@@ -149,6 +218,11 @@ def build_parser():
     add.add_argument("--model", default=DEFAULT_MODEL, help="точный ID модели у провайдера")
     add.add_argument("--replace", action="store_true", help="заменить существующий профиль")
     sub.add_parser("list", help="список профилей без ключей")
+    models = sub.add_parser("models", help="загрузить список моделей API")
+    models.add_argument("--profile", default="gwarden")
+    select = sub.add_parser("model", help="выбрать модель по её ID, не меняя ключ")
+    select.add_argument("id", help="точный ID модели у провайдера")
+    select.add_argument("--profile", default="gwarden")
     remove = sub.add_parser("remove", help="удалить профиль и его ключ")
     remove.add_argument("name")
     run = sub.add_parser("start", help="запустить OpenCode в текущей папке")
@@ -170,6 +244,16 @@ def main():
                 print("Профилей пока нет. Выполните: agentai add")
             for name, profile in profiles.items():
                 print(f"{name}\t{profile['base_url']}\t{profile['model']}")
+        elif args.command == "models":
+            profiles = load_profiles()
+            for model in sync_models(profiles, args.profile):
+                print(model)
+        elif args.command == "model":
+            profiles = load_profiles()
+            profile = get_profile(profiles, args.profile)
+            profile["model"] = validate_model(args.id)
+            save_profiles(profiles)
+            print(f"Выбрана модель {args.id} для профиля {args.profile}.")
         elif args.command == "remove":
             profiles = load_profiles()
             if args.name not in profiles:
