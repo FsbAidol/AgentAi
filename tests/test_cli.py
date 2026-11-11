@@ -55,7 +55,7 @@ class AgentAITests(unittest.TestCase):
     def test_launch_uses_agent_config_and_does_not_put_key_in_arguments(self):
         cli.save_profiles({"gwarden": {"base_url": cli.DEFAULT_URL, "model": "test-model", "api_key": "super-secret"}})
         args = cli.build_parser().parse_args(["start", "--message", "привет; echo test"])
-        with patch("shutil.which", return_value="/some/opencode"), patch("agentai.cli.fetch_models", return_value=["test-model", "other"]), patch("subprocess.call", return_value=0) as call:
+        with patch("shutil.which", return_value="/some/opencode"), patch("agentai.cli.opencode_generation", return_value=1), patch("agentai.cli.fetch_models", return_value=["test-model", "other"]), patch("subprocess.call", return_value=0) as call:
             self.assertEqual(cli.launch(args), 0)
         command = call.call_args.args[0]
         env = call.call_args.kwargs["env"]
@@ -73,10 +73,10 @@ class AgentAITests(unittest.TestCase):
     def test_full_access_requires_confirmation_and_is_explicit(self):
         cli.save_profiles({"gwarden": {"base_url": cli.DEFAULT_URL, "model": "model", "api_key": "key"}})
         args = cli.build_parser().parse_args(["start", "--full-access"])
-        with patch("shutil.which", return_value="/some/opencode"), patch("sys.stdin.isatty", return_value=False):
+        with patch("shutil.which", return_value="/some/opencode"), patch("agentai.cli.opencode_generation", return_value=1), patch("sys.stdin.isatty", return_value=False):
             with self.assertRaisesRegex(ValueError, "отменена"):
                 cli.launch(args)
-        with patch("shutil.which", return_value="/some/opencode"), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="FULL"), patch("agentai.cli.fetch_models", return_value=["model"]), patch("subprocess.call", return_value=0) as call:
+        with patch("shutil.which", return_value="/some/opencode"), patch("agentai.cli.opencode_generation", return_value=1), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="FULL"), patch("agentai.cli.fetch_models", return_value=["model"]), patch("subprocess.call", return_value=0) as call:
             cli.launch(args)
         config = json.loads(call.call_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
         self.assertNotIn("permission", config)
@@ -92,7 +92,7 @@ class AgentAITests(unittest.TestCase):
         with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="FULL"):
             cli.set_access(parser.parse_args(["access", "full"]))
         self.assertTrue(cli.load_profiles()["gwarden"]["full_access"])
-        with patch("shutil.which", return_value="/some/opencode"), patch("agentai.cli.fetch_models", return_value=["model"]), patch("subprocess.call", return_value=0) as call:
+        with patch("shutil.which", return_value="/some/opencode"), patch("agentai.cli.opencode_generation", return_value=1), patch("agentai.cli.fetch_models", return_value=["model"]), patch("subprocess.call", return_value=0) as call:
             cli.launch(parser.parse_args(["start"]))
         self.assertEqual(call.call_args.args[0][2], "build")
         config = json.loads(call.call_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
@@ -128,10 +128,40 @@ class AgentAITests(unittest.TestCase):
     def test_fetch_failure_falls_back_to_cached_models(self):
         cli.save_profiles({"gwarden": {"base_url": cli.DEFAULT_URL, "model": "old", "api_key": "secret", "models": ["cached"]}})
         args = cli.build_parser().parse_args(["start"])
-        with patch("shutil.which", return_value="/some/opencode"), patch("agentai.cli.fetch_models", side_effect=ValueError("offline")), patch("subprocess.call", return_value=0) as call:
+        with patch("shutil.which", return_value="/some/opencode"), patch("agentai.cli.opencode_generation", return_value=1), patch("agentai.cli.fetch_models", side_effect=ValueError("offline")), patch("subprocess.call", return_value=0) as call:
             cli.launch(args)
         config = json.loads(call.call_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
         self.assertIn("cached", config["provider"]["agentai"]["models"])
+
+    def test_v2_standalone_with_version_specific_config(self):
+        cli.save_profiles({"gwarden": {"base_url": cli.DEFAULT_URL, "model": "model", "api_key": "key", "full_access": True}})
+        parser = cli.build_parser()
+        for extra in ([], ["--message", "hello"]):
+            with patch("shutil.which", return_value="/opencode"), patch("agentai.cli.opencode_generation", return_value=2), patch("agentai.cli.fetch_models", return_value=["model"]), patch("subprocess.call", return_value=0) as call:
+                cli.launch(parser.parse_args(["start"] + extra))
+            command = call.call_args.args[0]
+            self.assertIn("--standalone", command)
+            if not extra:
+                self.assertEqual(command, ["/opencode", "--standalone"])
+            config = json.loads(call.call_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
+            self.assertEqual(config["default_agent"], "build")
+            self.assertEqual(config["agents"]["build"]["permissions"][0]["effect"], "allow")
+            self.assertEqual(config["providers"]["agentai"]["env"], ["AGENTAI_API_KEY"])
+            self.assertNotIn("key", json.dumps(config))
+
+    def test_detect_opencode_version(self):
+        for output, version in [("1.19.5", 1), ("opencode v2.2.7", 2)]:
+            with patch("subprocess.run") as run:
+                run.return_value.returncode = 0
+                run.return_value.stdout = output
+                run.return_value.stderr = ""
+                self.assertEqual(cli.opencode_generation("opencode"), version)
+        with patch("subprocess.run") as run:
+            run.return_value.returncode = 0
+            run.return_value.stdout = "3.0.0"
+            run.return_value.stderr = ""
+            with self.assertRaises(ValueError):
+                cli.opencode_generation("opencode")
 
     def test_corrupt_profiles_report_error(self):
         cli.storage_path().parent.mkdir(parents=True)

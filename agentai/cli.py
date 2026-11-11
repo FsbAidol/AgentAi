@@ -5,6 +5,8 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
+import ssl
 import subprocess
 import sys
 from urllib.parse import urlsplit
@@ -137,9 +139,20 @@ def fetch_models(profile):
         return models
     except HTTPError as exc:
         raise ValueError(f"API вернул HTTP {exc.code} при запросе /models") from None
-    except (URLError, OSError, ValueError, UnicodeError) as exc:
+    except URLError as exc:
+        reason = exc.reason
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            detail = "ошибка проверки TLS-сертификата"
+        elif isinstance(reason, (TimeoutError, socket.timeout)):
+            detail = "истекло время ожидания"
+        else:
+            detail = "ошибка сети или DNS"
+        raise ValueError(f"не удалось загрузить каталог /models: {detail}") from None
+    except (TimeoutError, socket.timeout):
+        raise ValueError("не удалось загрузить каталог /models: истекло время ожидания") from None
+    except (OSError, ValueError, UnicodeError):
         # Do not echo a server response or URL: either could contain sensitive data.
-        raise ValueError("не удалось загрузить каталог /models; проверьте соединение и API") from exc
+        raise ValueError("не удалось загрузить каталог /models: неверный ответ API или ошибка соединения") from None
 
 
 def profile_models(profile):
@@ -186,6 +199,35 @@ def make_config(profile, full_access):
     }
 
 
+def opencode_generation(executable):
+    try:
+        result = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValueError("Не удалось определить версию OpenCode; проверьте установку.") from exc
+    match = re.search(r"(?:^|\s)v?(\d+)\.\d+\.\d+", result.stdout + "\n" + result.stderr)
+    if result.returncode != 0 or not match or match.group(1) not in ("1", "2"):
+        raise ValueError("Не удалось определить версию OpenCode. Поддерживаются OpenCode v1 и v2.")
+    return int(match.group(1))
+
+
+def make_config_v2(profile, full_access):
+    permission = "allow" if full_access else "ask"
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "model": "agentai/" + profile["model"],
+        "default_agent": "build",
+        "providers": {"agentai": {
+            "name": "AgentAI API", "env": ["AGENTAI_API_KEY"],
+            "package": "@opencode/ai/providers/openai-compatible",
+            "settings": {"baseURL": profile["base_url"]},
+            "models": {model: {"name": model} for model in profile_models(profile)},
+        }},
+        "agents": {"build": {"system": PROMPT, "permissions": [
+            {"action": "*", "resource": "*", "effect": permission}
+        ]}},
+    }
+
+
 def confirm_full_access():
     print("ВНИМАНИЕ: полный доступ разрешает Build запускать команды и изменять любые доступные текущему пользователю файлы без подтверждения. Модель может ошибаться или выполнить вредоносные инструкции.", file=sys.stderr)
     if not sys.stdin.isatty() or input("Введите FULL для продолжения: ").strip() != "FULL":
@@ -214,6 +256,7 @@ def launch(args):
     executable = shutil.which("opencode")
     if not executable:
         raise ValueError("OpenCode не найден в PATH. Установите его: npm install -g opencode-ai")
+    generation = opencode_generation(executable)
     persistent_full = profile.get("full_access") is True
     full_access = args.full_access or persistent_full
     if persistent_full:
@@ -230,10 +273,18 @@ def launch(args):
               "Можно указать модель вручную: agentai model ID", file=sys.stderr)
     env = os.environ.copy()
     env["AGENTAI_API_KEY"] = profile["api_key"]
-    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(make_config(profile, full_access), ensure_ascii=False)
+    config = make_config_v2(profile, full_access) if generation == 2 else make_config(profile, full_access)
+    env["OPENCODE_CONFIG_CONTENT"] = json.dumps(config, ensure_ascii=False)
     command = [executable]
     if args.message:
-        command += ["run", "--agent", "build", "--model", "agentai/" + profile["model"], args.message]
+        command += ["run"]
+        if generation == 2:
+            command += ["--standalone"]
+        command += ["--agent", "build", "--model", "agentai/" + profile["model"], args.message]
+    elif generation == 2:
+        # V2's TUI has no --agent or --model flags. Its private server must
+        # inherit this launch's profile, key, and permissions, not a shared one.
+        command += ["--standalone"]
     else:
         command += ["--agent", "build", "--model", "agentai/" + profile["model"]]
     # Inherit the current working directory and terminal; no shell interpolation.
