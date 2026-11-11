@@ -59,13 +59,14 @@ class AgentAITests(unittest.TestCase):
             self.assertEqual(cli.launch(args), 0)
         command = call.call_args.args[0]
         env = call.call_args.kwargs["env"]
+        self.assertEqual(command[command.index("--agent") + 1], "build")
         self.assertNotIn("super-secret", repr(command))
         self.assertEqual(command[-1], "привет; echo test")
         self.assertEqual(env["AGENTAI_API_KEY"], "super-secret")
         config = json.loads(env["OPENCODE_CONFIG_CONTENT"])
         self.assertIn("other", config["provider"]["agentai"]["models"])
-        self.assertEqual(config["permission"], "ask")
-        self.assertEqual(config["agent"]["agentai"]["permission"], "ask")
+        self.assertNotIn("permission", config)
+        self.assertEqual(config["agent"]["build"]["permission"], "ask")
         self.assertEqual(config["provider"]["agentai"]["options"]["apiKey"], "{env:AGENTAI_API_KEY}")
         self.assertNotIn("super-secret", env["OPENCODE_CONFIG_CONTENT"])
 
@@ -73,13 +74,34 @@ class AgentAITests(unittest.TestCase):
         cli.save_profiles({"gwarden": {"base_url": cli.DEFAULT_URL, "model": "model", "api_key": "key"}})
         args = cli.build_parser().parse_args(["start", "--full-access"])
         with patch("shutil.which", return_value="/some/opencode"), patch("sys.stdin.isatty", return_value=False):
-            with self.assertRaisesRegex(ValueError, "отменён"):
+            with self.assertRaisesRegex(ValueError, "отменена"):
                 cli.launch(args)
         with patch("shutil.which", return_value="/some/opencode"), patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="FULL"), patch("agentai.cli.fetch_models", return_value=["model"]), patch("subprocess.call", return_value=0) as call:
             cli.launch(args)
         config = json.loads(call.call_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
-        self.assertEqual(config["permission"], "allow")
-        self.assertEqual(config["agent"]["agentai"]["permission"], "allow")
+        self.assertNotIn("permission", config)
+        self.assertEqual(config["agent"]["build"]["permission"], "allow")
+
+    def test_persistent_full_access_and_reversal(self):
+        cli.save_profiles({"gwarden": {"base_url": cli.DEFAULT_URL, "model": "model", "api_key": "key"}})
+        parser = cli.build_parser()
+        with patch("sys.stdin.isatty", return_value=False):
+            with self.assertRaisesRegex(ValueError, "отменена"):
+                cli.set_access(parser.parse_args(["access", "full"]))
+        self.assertNotIn("full_access", cli.load_profiles()["gwarden"])
+        with patch("sys.stdin.isatty", return_value=True), patch("builtins.input", return_value="FULL"):
+            cli.set_access(parser.parse_args(["access", "full"]))
+        self.assertTrue(cli.load_profiles()["gwarden"]["full_access"])
+        with patch("shutil.which", return_value="/some/opencode"), patch("agentai.cli.fetch_models", return_value=["model"]), patch("subprocess.call", return_value=0) as call:
+            cli.launch(parser.parse_args(["start"]))
+        self.assertEqual(call.call_args.args[0][2], "build")
+        config = json.loads(call.call_args.kwargs["env"]["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(config["agent"]["build"]["permission"], "allow")
+        with patch("sys.stdin.isatty", return_value=True), patch("getpass.getpass", return_value="new-key"):
+            cli.add_profile(parser.parse_args(["add", "--replace"]))
+        self.assertTrue(cli.load_profiles()["gwarden"]["full_access"])
+        cli.set_access(parser.parse_args(["access", "ask"]))
+        self.assertNotIn("full_access", cli.load_profiles()["gwarden"])
 
     def test_fetch_and_select_models(self):
         cli.save_profiles({"gwarden": {"base_url": cli.DEFAULT_URL, "model": "old", "api_key": "secret"}})
